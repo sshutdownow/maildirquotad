@@ -5,63 +5,288 @@
  *  it under the terms of the GNU General Public License as published by
  *  the Free Software Foundation; either version 2, or (at your option)
  *  any later version.
-	  
+
  *  This program is distributed in the hope that it will be useful,
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  *  GNU General Public License for more details.
- *		      
+ *
  * $Id$
  *
  */
 
+#include <sys/queue.h>
 #include <sys/types.h>
+#include <sys/param.h>
+
 #include <sys/time.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/signal.h>
 #include <signal.h>
 
 #include <unistd.h>
-#include <errno.h>
+#include <libutil.h>
 #include <fcntl.h>
-#include <pwd.h>
-#include <grp.h>
-#include <syslog.h>
 #include <err.h>
+#include <errno.h>
+#include <pwd.h>
+#include <syslog.h>
+#include <fts.h>
+#include <limits.h>
 
 #include <string.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
 
+#include <event.h>
+
+
+extern char *__progname;
+
+static unsigned int client_count = 0, id_count = 0;
+
+typedef struct client {
+    u_int32_t                id;
+    struct sockaddr_storage  client_ss;
+    struct bufferevent      *client_bufev;
+    int                      client_fd;
+    char                     cbuf[PATH_MAX];
+    size_t                   cbuf_valid;
+    LIST_ENTRY(client)	     entry;
+} client_t, *p_client_t;
+
+LIST_HEAD(, client) clients = LIST_HEAD_INITIALIZER(clients);
+
+static p_client_t
+init_client(void)
+{
+    p_client_t p;
+
+    p = calloc(1, sizeof(client_t));
+    if (p == NULL)
+        return (NULL);
+
+    p->id = id_count++;
+    p->client_fd = -1;
+    p->cbuf[0] = '\0';
+    p->cbuf_valid = 0;
+    p->client_bufev = NULL;
+
+    LIST_INSERT_HEAD(&clients, p, entry);
+    client_count++;
+
+    return (p);
+}
+
+static void
+end_client(p_client_t p)
+{
+    syslog(LOG_INFO, "#%d ending client", p->id);
+
+    if (p->client_fd != -1)
+        close(p->client_fd);
+
+    if (p->client_bufev)
+        bufferevent_free(p->client_bufev);
+
+    LIST_REMOVE(p, entry);
+    free(p);
+    client_count--;
+}
+
+static void
+client_error(struct bufferevent *bufev, short what, void *arg)
+{
+    p_client_t p = arg;
+
+    if (what & EVBUFFER_EOF)
+        syslog(LOG_INFO, "#%d client close", p->id);
+    else if (what == (EVBUFFER_ERROR | EVBUFFER_READ))
+        syslog(LOG_ERR, "#%d client reset connection", p->id);
+    else if (what & EVBUFFER_TIMEOUT)
+        syslog(LOG_ERR, "#%d client timeout", p->id);
+    else if (what & EVBUFFER_WRITE)
+        syslog(LOG_ERR, "#%d client write error: %d", p->id, what);
+    else
+        syslog(LOG_ERR, "#%d abnormal client error: %d", p->id, what);
+
+    end_client(p);
+}
+
+static unsigned int
+getline(char *buf, size_t *valid, char *linebuf, size_t *p_linelen)
+{
+    size_t i;
+
+    if (*valid > PATH_MAX)
+        return (-1);
+
+    /* Copy to linebuf while searching for a newline. */
+    for (i = 0; i < *valid; i++) {
+        linebuf[i] = buf[i];
+        if (buf[i] == '\0' || buf[i] == '\n')
+            break;
+    }
+
+    if (i == *valid) {
+        /* No newline found. */
+        linebuf[0] = '\0';
+        *p_linelen = 0;
+        if (i < PATH_MAX)
+            return (0);
+        return (-1);
+    }
+
+    linebuf[i] = '\0';
+    *p_linelen = i + 1;
+    *valid -= *p_linelen;
+
+    /* Move leftovers to the start. */
+    if (*valid != 0)
+        memmove(buf, buf + *p_linelen, *valid);
+
+    return *p_linelen;
+}
+
+static void
+client_read(struct bufferevent *bufev, void *arg)
+{
+    p_client_t  p = arg;
+    size_t buf_avail, read;
+    char linebuf[PATH_MAX + 1];
+    size_t linelen;
+    long long unsigned int savednumber = 0;
+    int n;
+
+    do {
+        buf_avail = sizeof(p->cbuf) - p->cbuf_valid;
+        read = bufferevent_read(bufev, p->cbuf + p->cbuf_valid,
+                                buf_avail);
+        p->cbuf_valid += read;
+
+        while ((n = getline(p->cbuf, &p->cbuf_valid, linebuf, &linelen)) > 0) {
+            struct stat sb;
+
+            syslog(LOG_DEBUG, "#%d client: '%s'", p->id, linebuf);
+
+            if (stat(linebuf, &sb) < 0) {
+                syslog(LOG_ERR, "#%d client stat() failed: %m", p->id);
+            }
+
+            if (S_ISREG(sb.st_mode)) {
+                savednumber = sb.st_size;
+            } else if (S_ISDIR(sb.st_mode)) {
+                FTS  *fts;
+                FTSENT *ent;
+                char *path[] = { linebuf, NULL };
+
+                if ((fts = fts_open(path, FTS_PHYSICAL, NULL)) == NULL) {
+                    syslog(LOG_ERR, "#%d client fts_open() on path '%s' failed: %m", p->id, linebuf);
+                }
+
+                while ((ent = fts_read(fts)) != NULL) {
+                    switch (ent->fts_info) {
+                    case FTS_D:                     /* Ignore. */
+                        break;
+
+                    case FTS_DP:
+                        ent->fts_parent->fts_bignum += ent->fts_bignum += ent->fts_statp->st_blocks;
+                        break;
+
+                    case FTS_DC:                    /* Ignore. */
+                        break;
+
+                    case FTS_DNR:                   /* Warn, continue. */
+                    case FTS_ERR:
+                    case FTS_NS:
+                        syslog(LOG_WARNING, "#%d client fts() on path '%s' failed : %m", p->id, ent->fts_path);
+                        break;
+
+                    default:
+                        ent->fts_parent->fts_bignum += ent->fts_statp->st_blocks;
+                        break;
+                    }
+                    savednumber = ent->fts_parent->fts_bignum;
+                }
+
+            } else {
+                syslog(LOG_ERR, "#%d client '%s' is not regular file and is not directory", p->id, linebuf);
+                continue;
+            }
+
+            syslog(LOG_DEBUG, "#%d client Mailbox is %llu bytes", p->id, savednumber);
+            linelen = snprintf(linebuf, sizeof(linebuf), "%llu", savednumber);
+            linebuf[sizeof(linebuf)-1] = '\0';
+            if (send(p->client_fd, linebuf, linelen, 0) < 0) {
+                syslog(LOG_ERR, "#%d client send() failed: %m", p->id);
+            }
+
+        }
+
+        if (n == -1) {
+            syslog(LOG_ERR, "#%d client command too long or not clean", p->id);
+            end_client(p);
+            return;
+        }
+    } while (read == buf_avail);
+}
+
+
+static void
+handle_connection(const int fd, short event, void *arg)
+{
+    int sk_fd;
+    p_client_t p;
+    struct sockaddr_un addr;
+    socklen_t addrlen = sizeof(addr);
+
+    if ((sk_fd = accept(fd, (struct sockaddr*)&addr, &addrlen)) < 0) {
+        syslog(LOG_ERR, "accept() failed: %m");
+        return;
+    }
+
+    /* Allocate client and copy back the info from the accept(). */
+    p = init_client();
+    p->client_fd = sk_fd;
+
+    /*
+     * Setup buffered events.
+     */
+    p->client_bufev = bufferevent_new(p->client_fd, &client_read, NULL,
+                                      &client_error, p);
+    if (p->client_bufev == NULL) {
+        syslog(LOG_CRIT, "#%d bufferevent_new client failed", p->id);
+        end_client(p);
+    }
+    bufferevent_settimeout(p->client_bufev, 120, 0);
+    bufferevent_enable(p->client_bufev, EV_READ | EV_TIMEOUT);
+
+    return;
+}
 
 int
 main(int argc, char **argv)
 {
     int	ch;
     char *pwname = "mailnull",
-                   *grname = "mailnull",
-                             *pidfilename = "/var/run/quotad/mailquotad.pid",
-                                        *sockname = "/tmp/mailquotad.socket";
-    struct passwd  *pw;
-    struct group   *gr;
-    FILE  *pidfile;
-    struct sigaction sigact;
-    int	sk_fd = -1, sockopt, fdmax;
-    struct sockaddr_un sa;
-    fd_set read_fds, master;
+                   *pidfilename = "/var/run/mailquotad.pid",
+                                  *sockname = "/tmp/mailquotad.socket";
+    struct passwd *pw;
+    pid_t pid;
+    struct pidfh *pfh;
+    int	sk_fd = -1, sockopt;
+    struct sockaddr_un sun;
+    struct event ev;
 
-    while ((ch = getopt(argc, argv, "p:u:g:s:d")) != -1) {
+    while ((ch = getopt(argc, argv, "p:u:s:d")) != -1) {
         switch (ch) {
         case 'p':
             pidfilename = strdup(optarg);
             break;
         case 'u':
             pwname = strdup(optarg);
-            break;
-        case 'g':
-            grname = strdup(optarg);
             break;
         case 's':
             sockname = strdup(optarg);
@@ -76,39 +301,42 @@ main(int argc, char **argv)
     if (argc > 0) {
         err(1, "bogus extra arguments");
     }
-    pw = getpwnam(pwname);
-    if (!pw) {
-        err(1, "getpwnam('%s') failed", pwname);
+
+    if (getuid() != 0)
+        errx(1, "needs to start as root");
+
+    if ((pw = getpwnam(pwname)) == NULL) {
+        err(1, "getpwnam('%s') failed: %m", pwname);
     }
-    gr = getgrnam(grname);
-    if (!gr) {
-        err(1, "getgrnam('%s') failed", grname);
+
+    pfh = pidfile_open(pidfilename, 0600, &pid);
+    if (pfh == NULL) {
+        if (errno == EEXIST) {
+            errx(EXIT_FAILURE, "Daemon already running, pid: %jd.",
+                 (intmax_t)pid);
+        }
+        /* If we cannot create pidfile from other reasons, only warn. */
+        warn("Cannot open or create pidfile");
     }
-    if (setgid(gr->gr_gid) < 0) {
-        err(1, "setgid('%d') failed", gr->gr_gid);
+
+    if (setgroups(1, &pw->pw_gid) < 0 ||
+            setresgid(pw->pw_gid, pw->pw_gid, pw->pw_gid) < 0 ||
+            setresuid(pw->pw_uid, pw->pw_uid, pw->pw_uid) < 0)
+    {
+        err(1, "set gid to %d and uid to %d failed: %m", pw->pw_gid, pw->pw_uid);
     }
-    if (setuid(pw->pw_uid) < 0) {
-        err(1, "setuid('%d') failed", pw->pw_uid);
-    }
+
     if (daemon(0, 0) < 0) {
         err(1, "daemon() failed");
     }
-
-    if ((pidfile = fopen(pidfilename, "w")) != NULL) {
-        fprintf(pidfile, "%d\n", getpid());
-        fclose(pidfile);
-    }
-    openlog("mailquotad", LOG_NDELAY | LOG_PID, LOG_DAEMON);
+    
+    pidfile_write(pfh);
+    
+    openlog(__progname, LOG_NDELAY | LOG_PID, LOG_DAEMON);
     syslog(LOG_INFO, "started");
 
     /* ignore SIGPIPE signal */
-    sigact.sa_handler = SIG_IGN;
-    sigact.sa_flags = 0;
-    if (sigemptyset(&sigact.sa_mask) < 0 ||
-            sigaction(SIGPIPE, &sigact, 0) < 0) {
-        syslog(LOG_ERR, "failed to ignore SIGPIPE; sigaction: %m");
-        goto fail;
-    }
+    signal(SIGPIPE, SIG_IGN);
 
     if ((sk_fd = socket(PF_LOCAL, SOCK_STREAM, 0)) < 0) {
         syslog(LOG_ERR, "socket() failed %m");
@@ -121,13 +349,13 @@ main(int argc, char **argv)
         goto fail;
     }
 
-    bzero(&sa, sizeof(sa));
-    sa.sun_family = AF_UNIX;
-    strlcpy(sa.sun_path, sockname, sizeof(sa.sun_path));
-    if (bind(sk_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+    bzero(&sun, sizeof(sun));
+    sun.sun_family = AF_UNIX;
+    strlcpy(sun.sun_path, sockname, sizeof(sun.sun_path));
+    if (bind(sk_fd, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
         syslog(LOG_ERR, "bind() failed: %m");
 
-        if (connect(sk_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        if (connect(sk_fd, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
             syslog(LOG_ERR, "socket %s exists, but not allowing connection, " \
                    "assuming it was left over from forced program termination",
                    sockname);
@@ -137,11 +365,11 @@ main(int argc, char **argv)
                        sockname);
                 goto fail;
             }
-            if (bind(sk_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+            if (bind(sk_fd, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
                 syslog(LOG_ERR, "bind() failed: %m");
                 goto fail;
             }
-            syslog(LOG_DEBUG, "successfully replaced leftover socket '%s'",
+            syslog(LOG_NOTICE, "successfully replaced leftover socket '%s'",
                    sockname);
         } else {
             syslog(LOG_ERR, "socket %s exists and seems to " \
@@ -152,7 +380,7 @@ main(int argc, char **argv)
         }
     }
     if (chmod(sockname, S_IRWXU | S_IRWXG) < 0) {
-        syslog(LOG_ERR, "failed chmod on '%s': %m", sockname);
+        syslog(LOG_ERR, "chmod on '%s' failed: %m", sockname);
         goto fail;
     }
     if (listen(sk_fd, 150) < 0) {
@@ -160,91 +388,26 @@ main(int argc, char **argv)
         goto fail;
     }
 
-    FD_ZERO(&read_fds);
-    FD_ZERO(&master);
+    /* Initalize the event library */
+    event_init();
 
-    /* add the socket to the master set */
-    FD_SET(sk_fd, &master);
+    event_set(&ev, sk_fd, EV_READ | EV_PERSIST, handle_connection, &ev);
 
-    fdmax = sk_fd;
+    /* Add it to the active events, without a timeout */
+    event_add(&ev, NULL);
 
-    for (;;) {
-        int newfd, i, j;
-
-        read_fds = master;
-
-        if (select(fdmax + 1, &read_fds, NULL, NULL, NULL) < 0) {
-	    if (errno == EINTR) {
-		continue;
-	    }
-            syslog(LOG_ERR, "select() failed: %m");
-            goto fail;
-        }
-
-        for (i = 0; i <= fdmax; i++) {
-            if (FD_ISSET(i, &read_fds)) {
-                /* we got one */
-                if (i == sk_fd) {
-		    struct sockaddr_un ra;
-                    socklen_t addrlen = sizeof(ra);
-                    /* handle new connections */
-                    if ((newfd = accept(sk_fd, (struct sockaddr *)&ra, &addrlen)) < 0) {
-        		syslog(LOG_ERR, "accept() failed: %m");
-                    } else {
-                        FD_SET(newfd, &master);
-                        /* add to master set */
-                        if (newfd > fdmax) {
-                            /* keep track of the maximum */
-                            fdmax = newfd;
-                        }
-                    }
-                } else {
-		    unsigned int nbytes;
-		    char buf[1024];
-
-                    /* handle data from a client */
-                    if ((nbytes = recv(i, buf, sizeof(buf), 0)) <= 0) {
-                        /* got error or connection closed by client */
-                        if (nbytes == 0) {
-                            /* connection closed */
-                        } else {
-                            syslog(LOG_ERR, "recv() failed: %m");
-                        }
-                        close(i);
-	                /* bye */
-                        FD_CLR(i, &master);
-                        /* remove from master set */
-                    } else {
-                        /* we got some data from a client */
-                        for (j = 0; j <= fdmax; j++) {
-                            /* send to everyone */
-                            if (FD_ISSET(j, &master)) {
-                                /* except the listener and ourselves */
-                                if (j != sk_fd && j != i) {
-				    unsigned int nbytes;
-				    char buf[1024];
-                                    if (send(j, buf, nbytes, 0) < 0) {
-                                        syslog(LOG_ERR, "send() failed: %m");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    event_dispatch();
 
 fail:
     if (sk_fd != -1) {
         close(sk_fd);
     }
+
     unlink(sockname);
-    unlink(pidfilename);
+
+    if (pfh)
+	pidfile_remove(pfh);
     closelog();
 
     return EXIT_FAILURE;
-
-    return EXIT_SUCCESS;
 }
