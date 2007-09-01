@@ -49,7 +49,7 @@ static unsigned int client_count = 0, id_count = 0;
 
 typedef struct client {
     u_int32_t                id;
-    struct sockaddr_storage  client_ss;
+//    struct sockaddr_storage  client_ss;
     struct bufferevent      *client_bufev;
     int                      client_fd;
     char                     cbuf[PATH_MAX];
@@ -59,15 +59,17 @@ typedef struct client {
 
 LIST_HEAD(, client) clients = LIST_HEAD_INITIALIZER(clients);
 
+
 static p_client_t
 init_client(void)
 {
     p_client_t p;
 
     p = calloc(1, sizeof(client_t));
-    if (p == NULL)
+    if (p == NULL) {
+        syslog(LOG_CRIT, "%s calloc failed: %m", __FUNCTION__);
         return (NULL);
-
+    }
     p->id = id_count++;
     p->client_fd = -1;
     p->cbuf[0] = '\0';
@@ -172,45 +174,46 @@ client_read(struct bufferevent *bufev, void *arg)
             syslog(LOG_DEBUG, "#%d client: '%s'", p->id, linebuf);
 
             if (stat(linebuf, &sb) < 0) {
-                syslog(LOG_ERR, "#%d client stat() failed: %m", p->id);
+                syslog(LOG_ERR, "#%d client stat() on '%s' failed: %m", p->id, linebuf);
+                continue;
             }
 
             if (S_ISREG(sb.st_mode)) {
                 savednumber = sb.st_size;
             } else if (S_ISDIR(sb.st_mode)) {
-                FTS  *fts;
-                FTSENT *ent;
-                char *path[] = { linebuf, NULL };
+                char * const path[] = { linebuf, NULL };
+                FTSENT *cur;
+                FTS *ftsp;
 
-                if ((fts = fts_open(path, FTS_PHYSICAL, NULL)) == NULL) {
-                    syslog(LOG_ERR, "#%d client fts_open() on path '%s' failed: %m", p->id, linebuf);
+                ftsp = fts_open(path, FTS_LOGICAL | FTS_COMFOLLOW | FTS_NOCHDIR, NULL);
+                if (!ftsp) {
+                    syslog(LOG_CRIT, "#%d client fts_open('%s') failed: %m", p->id, linebuf);
+                    continue;
                 }
-
-                while ((ent = fts_read(fts)) != NULL) {
-                    switch (ent->fts_info) {
-                    case FTS_D:                     /* Ignore. */
-                        break;
-
+                while ((cur = fts_read(ftsp))) {
+                    switch (cur->fts_info) {
                     case FTS_DP:
-                        ent->fts_parent->fts_bignum += ent->fts_bignum += ent->fts_statp->st_blocks;
-                        break;
-
-                    case FTS_DC:                    /* Ignore. */
-                        break;
-
-                    case FTS_DNR:                   /* Warn, continue. */
-                    case FTS_ERR:
+                        /* we only visit in preorder */
+                        continue;
+                    case FTS_F:
+                    case FTS_DEFAULT:
+			savednumber += cur->fts_statp->st_size;
+                    case FTS_D:
+                    case FTS_DNR:
                     case FTS_NS:
-                        syslog(LOG_WARNING, "#%d client fts() on path '%s' failed : %m", p->id, ent->fts_path);
+                    case FTS_NSOK:
+                    case FTS_SLNONE:
+                    case FTS_SL:
                         break;
-
+                    case FTS_DC: /* FALLTHROUGH */
                     default:
-                        ent->fts_parent->fts_bignum += ent->fts_statp->st_blocks;
-                        break;
+                        goto nax;
                     }
-                    savednumber = ent->fts_parent->fts_bignum;
                 }
-
+nax:
+                if (fts_close(ftsp)) {
+                    syslog(LOG_CRIT, "#%d client fts_close() failed: %m", p->id);
+                }
             } else {
                 syslog(LOG_ERR, "#%d client '%s' is not regular file and is not directory", p->id, linebuf);
                 continue;
@@ -222,7 +225,6 @@ client_read(struct bufferevent *bufev, void *arg)
             if (send(p->client_fd, linebuf, linelen, 0) < 0) {
                 syslog(LOG_ERR, "#%d client send() failed: %m", p->id);
             }
-
         }
 
         if (n == -1) {
@@ -329,9 +331,9 @@ main(int argc, char **argv)
     if (daemon(0, 0) < 0) {
         err(1, "daemon() failed");
     }
-    
+
     pidfile_write(pfh);
-    
+
     openlog(__progname, LOG_NDELAY | LOG_PID, LOG_DAEMON);
     syslog(LOG_INFO, "started");
 
@@ -406,7 +408,7 @@ fail:
     unlink(sockname);
 
     if (pfh)
-	pidfile_remove(pfh);
+        pidfile_remove(pfh);
     closelog();
 
     return EXIT_FAILURE;
