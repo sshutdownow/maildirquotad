@@ -1,35 +1,42 @@
 #!/usr/bin/perl -w
 use strict;
 
-use Socket;
 use Getopt::Std;
 use POSIX;
 use File::Basename;
 use Fcntl qw/LOCK_EX LOCK_NB/;
 use File::Find;
+use IO::Socket;
 
-use vars qw/$maxkeep $sockname $pidfile $debugmode $server_user $server_group $opt_d $opt_s $opt_p $opt_u $opt_g/;
+use vars qw/$sockname $pidfile $debugmode $server_user $server_group
+    $mail_spool_prefix $opt_h $opt_d $opt_s $opt_p $opt_u $opt_g $opt_m/;
 
-##############################################################################
-# Configuration
-##############################################################################
-
-# Maximum time to trust cached data.
-$maxkeep = 60;
-
-##############################################################################
-# End of Configuration
-##############################################################################
 
 # default values
 $sockname = '/var/run/quotad/mailquotad.sock';
 $pidfile  = '/var/run/quotad/mailquotad.pid';
+$mail_spool_prefix = '/var/spool/mail';
 $server_user = 'mailnull';
 $server_group = 'mailnull';
 $debugmode = 0;
 
 
-getopts('d:s:p:u:g:');
+getopts('hd:s:p:u:g:m:');
+
+if ($opt_h) {
+    print <<'USAGE';
+-h this help message
+-d <maildir> run in debug mode, do not became daemon
+-s <UNIX socket path>
+-p <pid file path>
+-u <user>
+-g <group>
+-m <mail spool prefix>
+
+USAGE
+
+    exit(0);
+}
 
 if ($opt_d) {
     # This debug mode allows you to run your own checks against the maildir quota checker.
@@ -48,6 +55,10 @@ if ($opt_u) {
 }
 if ($opt_g) {
     $server_group = $opt_g;
+}
+if ($opt_m) {
+    $mail_spool_prefix = $opt_m;
+    die "mail spool prefix doesn't exist" unless (-d $mail_spool_prefix);
 }
 
 # check if we are already running
@@ -82,38 +93,57 @@ setsid or die "can't start a new session: $!";
 # ignore broken pipes
 $SIG{PIPE} = 'IGNORE';
 
-# make the socket and listen to it.
-socket(UNIX, PF_UNIX, SOCK_STREAM, 0) || die "socket failed: $!";
-unlink($sockname);
-bind(UNIX, sockaddr_un($sockname)) || die "bind failed: $!";
-chmod(0666, $sockname);
-listen(UNIX, SOMAXCONN) || die "listen failed: $!";
-
 # do the main bit.
 mainloop();
 
 sub mainloop {
-	# change our name
-	$0 = "mailquotad";
+    my ($client, $child, $maildirpath);
 
-	for (;;) {
-		my $maildirpath;
-		my $quotastatus; 
+    # change our name
+    $0 = "mailquotad";
+    
+    # make the socket and listen to it.
+    unlink($sockname);
+    my $socket = new IO::Socket::UNIX(Local => $sockname,
+				  Type => SOCK_STREAM,
+				  Listen => SOMAXCONN,
+				  Reuse => 1) or die "socket failed: $!";
+    chmod(0666, $sockname);
+	
+    $SIG{CHLD} = \&child_reap;
 
-		# read the socket, expecting a path.
-		accept(C, UNIX);
-		sysread(C, $maildirpath, 1024);
-		chomp($maildirpath);
-		$quotastatus = checkquota($maildirpath);
-		syswrite(C, $quotastatus);
-		close(C);
+    while (1) {
+	while ($client = $socket->accept()) {
+	    if ($child = fork()) {
+		    $client->close;
+	    } elsif (defined($child)) {
+		    $socket->close();
+		    $client->autoflush(1);
+		    # read the socket, expecting a path.
+		    if (defined($maildirpath = <$client>)) {
+			chomp($maildirpath);
+			my $quotastatus = checkquota($maildirpath);
+			print $client $quotastatus;
+		    }
+		    $client->close();
+		    exit(0);
+	    } else {
+		    warn "$0 [$$] fork failed: $!";
+	    }
 	}
+    }
 }
 
 sub checkquota {
     my $maildir = shift @_;
     my $size = 0;
-    find( sub { $size += -s if -f;}, "/var/spool/mail/${maildir}");
+    return -1 unless -d "${mail_spool_prefix}/${maildir}";
+    find( sub { $size += -s if -f;}, "${mail_spool_prefix}/${maildir}");
     print "quota for $maildir is $size\n" if ($debugmode);
     return $size;
+}
+
+sub child_reap {
+    1 until (-1 == waitpid(-1, WNOHANG));
+    $SIG{CHLD} = \&child_reap;
 }
