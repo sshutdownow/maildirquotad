@@ -10,7 +10,7 @@ Exim has no builtin facility for checking the quotas of a mailbox at RCPT TO tim
 {{{
 -h this help message
 -d <maildir> run in debug mode, do not became daemon
--s <UNIX socket path>
+-s <UNIX socket path|IP address:port>
 -p <pid file path>
 -u <user>
 -g <group>
@@ -33,3 +33,5 @@ acl_check_rcpt:
                                         `is_active`='Y' }\
                                     }}{2s}{\n}{socket-error}}}{yes}{no}}
 }}}
+
+for using tcp socket change {{{ readsocket{/var/run/quotad/mailquotad.sock} }}} to {{{ readsocket{inet:10.0.0.10:64003} }}}
