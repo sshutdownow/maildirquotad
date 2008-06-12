@@ -28,7 +28,7 @@ use File::Find;
 use IO::Socket;
 use Sys::Syslog qw/:standard :macros/;
 
-use vars qw/$sockname $pidfile $debugmode $server_user $server_group
+use vars qw/$work $sockname $pidfile $debugmode $server_user $server_group
     $mail_spool_prefix $opt_h $opt_d $opt_s $opt_p $opt_u $opt_g $opt_m/;
 
 
@@ -40,14 +40,14 @@ $server_user = 'mailnull';
 $server_group = 'mailnull';
 $debugmode = 0;
 
-
+# cli options
 getopts('hd:s:p:u:g:m:');
 
 if ($opt_h) {
     print <<'USAGE';
 -h this help message
 -d <maildir> run in debug mode, do not became daemon
--s <UNIX socket path>
+-s <UNIX socket path|IP address[:port]>
 -p <pid file path>
 -u <user>
 -g <group>
@@ -81,62 +81,80 @@ if ($opt_m) {
     die "mail spool prefix doesn't exist" unless (-d $mail_spool_prefix);
 }
 
+
+# program
+$work = 1;
+
 my $program_name = basename($0);
 
 # open syslog
 openlog($program_name, "ndelay,pid", LOG_DAEMON);
+syslog(LOG_INFO, "start daemon");
 
 # check if we are already running
-open(SELFLOCK, '<', "$0") or die("aborting: couldn't open $0: $!\n");
-flock(SELFLOCK, LOCK_EX | LOCK_NB) or die("aborting: another $program_name is already running\n");
+open(SELFLOCK, '<', "$0") or error(LOG_ERR, "aborting: couldn't open $0: $!\n");
+flock(SELFLOCK, LOCK_EX | LOCK_NB) or error(LOG_ERR, "aborting: another $program_name is already running\n");
 
-chdir('/') or die "aborting: can't chdir to '/': $!";
+chdir('/') or error(LOG_ERR, "aborting: can't chdir to '/': $!");
 
 # drop privileges
-setgid((getgrnam($server_user))[3])  or die "aborting: setgid() failed: $?";
-setuid((getpwnam($server_group))[2]) or die "aborting: setuid() failed: $?";
+setgid((getgrnam($server_user))[3])  or error(LOG_ERR, "aborting: setgid() failed: $?");
+setuid((getpwnam($server_group))[2]) or error(LOG_ERR, "aborting: setuid() failed: $?");
 
 # daemonize so that we run in the background.
 defined (my $pid = fork) or die "can't fork: $!";
 exit if ($pid);
 
+# set signal handlers
 foreach my $sig ($SIG{TSTP}, $SIG{TTIN}, $SIG{TTOU}, $SIG{HUP}) {
     $sig = 'IGNORE';
 }
-
-# record our pid.
-open(PIDFILE, '>', "$pidfile") or die "can't create pidfile $pidfile: $!|";
-print PIDFILE getpid();
-close(PIDFILE) or warn "close pidfile $pidfile failed: $!";
-
-open STDIN, '/dev/null' or die "can't read /dev/null: $!";
-open STDOUT, '>>/dev/null' or die "can't write to /dev/null: $!";
-open STDERR, '>>/dev/null' or die "can't write to /dev/null: $!";
-setsid or die "can't start a new session: $!";
-
 # ignore broken pipes
 $SIG{PIPE} = 'IGNORE';
+# avoiding zombies
+$SIG{CHLD} = \&child_reap;
+# normally exits 
+$SIG{INT} = $SIG{TERM} = \&stop_working;
+
+
+# record our pid.
+open(PIDFILE, '>', "$pidfile") or error(LOG_ERR, "can't create pidfile $pidfile: $!");
+print PIDFILE getpid();
+close(PIDFILE) or warning(LOG_WARNING, "close pidfile $pidfile failed: $!");
+
+# close tty
+open STDIN, '/dev/null' or error(LOG_ERR, "can't read /dev/null: $!");
+open STDOUT, '>>/dev/null' or error(LOG_ERR, "can't write to /dev/null: $!");
+open STDERR, '>>/dev/null' or error(LOG_ERR, "can't write to /dev/null: $!");
+setsid or error(LOG_ERR, "can't start a new session: $!");
 
 # do the main bit.
 mainloop();
 
 sub mainloop {
-    my ($client, $child);
+    my ($socket, $client, $child) = (undef, undef, undef);
 
     # change our name
     $0 = "mailquotad";
     
     # make the socket and listen to it.
-    unlink($sockname);
-    my $socket = new IO::Socket::UNIX(Local => $sockname,
+    if ($sockname =~ m{^/}) { # unix socket
+	unlink($sockname) or warning(LOG_WARNING, "unlink failed: $!");
+	$socket = new IO::Socket::UNIX(Local => $sockname,
 				  Type => SOCK_STREAM,
 				  Listen => SOMAXCONN,
-				  Reuse => 1) or die "socket failed: $!";
-    chmod(0666, $sockname);
-	
-    $SIG{CHLD} = \&child_reap;
+				  ReuseAddr => 1) or error(LOG_ERR, "socket failed: $!");
+	chmod(0666, $sockname) or warning(LOG_WARNING, "chmod failed: $!");
+    } else { # tcp socket
+	$socket = new IO::Socket::INET(LocalAddr => $sockname,
+				  Proto => 'tcp',
+				  Type => SOCK_STREAM,
+				  Listen => SOMAXCONN,
+    				  ReuseAddr => 1) or error(LOG_ERR, "socket failed: $!");
+    }
+    	
 
-    while (1) {
+    while ($work) {
 	while ($client = $socket->accept()) {
 	    if ($child = fork()) {
 		$client->close;
@@ -150,28 +168,64 @@ sub mainloop {
 		    my $maildirpath = "$domain/$localpart";
 		    my $quotastatus = (checkquota($maildirpath) < $quota)? 'good' : 'bad';
 		    print $client $quotastatus;
-		    syslog(LOG_DEBUG, "quota for maildir for $maildirpath is $quotastatus");
+		    warning(LOG_DEBUG, "quota for maildir for $maildirpath is $quotastatus");
 		}
 		$client->close();
 		exit(0);
 	    } else {
-		syslog(LOG_ERR, "fork failed: $!");
+		warning(LOG_ERR, "fork failed: $!");
 	    }
 	}
     }
+    warning(LOG_INFO, "stop daemon");
+    $socket->close() or warning(LOG_ERR, "close main socket failed: $!");
+    unlink($sockname) if ($sockname =~ m{^/}); # remove unix socket
+    unlink($pidfile) or warning(LOG_ERR, "unlink pidfile failed: $!");
+    closelog();
+    exit(0);
 }
 
 sub checkquota {
     my $maildir = shift @_;
     my $size = 1024*512;
-    return -1 unless -d "${mail_spool_prefix}/${maildir}";
+    return -1 unless (-d "${mail_spool_prefix}/${maildir}");
     find( sub { $size += -s if -f;}, "${mail_spool_prefix}/${maildir}");
-    print "maildirsize for $maildir is $size\n" if ($debugmode);
-    syslog(LOG_DEBUG, "maildirsize for $maildir is $size");
+    warning(LOG_DEBUG, "maildirsize for $maildir is $size");
     return int($size/1024/1024);
 }
 
 sub child_reap {
     1 until (-1 == waitpid(-1, WNOHANG));
     $SIG{CHLD} = \&child_reap;
+}
+
+sub stop_working {
+    my $signame = shift;
+    $work = undef;
+    $SIG{INT} = $SIG{TERM} = \&stop_working;
+    warning(LOG_INFO, "SIG$signame received");
+}
+
+sub error {
+    my $priority = shift @_;
+    my $message = shift @_;
+    my $exitcode = shift @_ || 1;
+    
+    if ($debugmode) {
+	print STDERR $message, "\n";
+    } else {
+	syslog($priority, $message);
+    }
+    closelog();
+    exit($exitcode);
+}
+
+sub warning {
+    my ($priority, $message) = @_;
+    
+    if ($debugmode) {
+	print STDERR $message, "\n";
+    } else {
+	syslog($priority, $message);
+    }
 }
