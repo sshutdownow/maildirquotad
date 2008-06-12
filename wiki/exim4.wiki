@@ -1,0 +1,35 @@
+#summary using mailquotad with exim4.
+
+= Using mailquotad with exim =
+
+Exim has no builtin facility for checking the quotas of a mailbox at RCPT TO time. And when you have many MX servers and only one mail hub that stores mail data it became a real problem. So I have written program (now it is perl script) that is daemon, it creates socket and listen for text message that consists of local_part, domain and quota values delimited by colon. If mailbox is full daemon writes back word 'bad' else 'good' and than close connection.
+
+= Details =
+
+*mailquotad* is developed on FreeBSD, so check if default values fit to your system. *mailquotad* supports some options:
+{{{
+-h this help message
+-d <maildir> run in debug mode, do not became daemon
+-s <UNIX socket path>
+-p <pid file path>
+-u <user>
+-g <group>
+-m <mail spool prefix>
+}}} 
+
+add to your exim acl something like this:
+{{{
+acl_check_rcpt:
+#
+# ...
+#
+        deny    message       = e-mail address [$local_part@$domain] doesn't exist or blocked or mailbox is full
+                domains       = +local_domains
+                condition    = ${if eq{bad}{${readsocket{/var/run/quotad/mailquotad.sock}\
+                                {${lookup mysql{SELECT CONCAT(`username`, ':', `domain`, ':', `quota`)\
+                                    FROM TMAILBOX WHERE \
+                                        `username`='${quote_mysql:$local_part}' AND \
+                                        `domain`='${quote_mysql:$domain}' AND \
+                                        `is_active`='Y' }\
+                                    }}{2s}{\n}{socket-error}}}{yes}{no}}
+}}}
