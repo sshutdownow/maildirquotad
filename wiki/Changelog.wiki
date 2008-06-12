@@ -4,5 +4,5 @@
 
 ====12 Jun 2008====
 {{{
-The first working perl version 0.1 of *mailquotad* is released.
+The first working perl version 0.1 of mailquotad is released.
 }}}
