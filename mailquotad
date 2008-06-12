@@ -26,6 +26,7 @@ use File::Basename;
 use Fcntl qw/LOCK_EX LOCK_NB/;
 use File::Find;
 use IO::Socket;
+use Sys::Syslog qw/:standard :macros/;
 
 use vars qw/$sockname $pidfile $debugmode $server_user $server_group
     $mail_spool_prefix $opt_h $opt_d $opt_s $opt_p $opt_u $opt_g $opt_m/;
@@ -80,8 +81,12 @@ if ($opt_m) {
     die "mail spool prefix doesn't exist" unless (-d $mail_spool_prefix);
 }
 
-# check if we are already running
 my $program_name = basename($0);
+
+# open syslog
+openlog($program_name, "ndelay,pid", LOG_DAEMON);
+
+# check if we are already running
 open(SELFLOCK, '<', "$0") or die("aborting: couldn't open $0: $!\n");
 flock(SELFLOCK, LOCK_EX | LOCK_NB) or die("aborting: another $program_name is already running\n");
 
@@ -116,7 +121,7 @@ $SIG{PIPE} = 'IGNORE';
 mainloop();
 
 sub mainloop {
-    my ($client, $child, $maildirpath);
+    my ($client, $child);
 
     # change our name
     $0 = "mailquotad";
@@ -134,20 +139,23 @@ sub mainloop {
     while (1) {
 	while ($client = $socket->accept()) {
 	    if ($child = fork()) {
-		    $client->close;
+		$client->close;
 	    } elsif (defined($child)) {
-		    $socket->close();
-		    $client->autoflush(1);
-		    # read the socket, expecting a path.
-		    if (defined($maildirpath = <$client>)) {
-			chomp($maildirpath);
-			my $quotastatus = checkquota($maildirpath);
-			print $client $quotastatus;
-		    }
-		    $client->close();
-		    exit(0);
+		$socket->close();
+		$client->autoflush(1);
+		# read the socket, expecting a path.
+		if (defined(my $buf = <$client>)) {
+		    chomp($buf);
+		    my ($localpart, $domain, $quota) = split(/:/, $buf);
+		    my $maildirpath = "$domain/$localpart";
+		    my $quotastatus = (checkquota($maildirpath) < $quota)? 'good' : 'bad';
+		    print $client $quotastatus;
+		    syslog(LOG_DEBUG, "quota for maildir for $maildirpath is $quotastatus");
+		}
+		$client->close();
+		exit(0);
 	    } else {
-		    warn "$0 [$$] fork failed: $!";
+		syslog(LOG_ERR, "fork failed: $!");
 	    }
 	}
     }
@@ -155,11 +163,12 @@ sub mainloop {
 
 sub checkquota {
     my $maildir = shift @_;
-    my $size = 0;
+    my $size = 1024*512;
     return -1 unless -d "${mail_spool_prefix}/${maildir}";
     find( sub { $size += -s if -f;}, "${mail_spool_prefix}/${maildir}");
-    print "quota for $maildir is $size\n" if ($debugmode);
-    return $size;
+    print "maildirsize for $maildir is $size\n" if ($debugmode);
+    syslog(LOG_DEBUG, "maildirsize for $maildir is $size");
+    return int($size/1024/1024);
 }
 
 sub child_reap {
