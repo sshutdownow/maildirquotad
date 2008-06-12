@@ -2,11 +2,11 @@
 
 = Using mailquotad with exim =
 
-Exim has no builtin facility for checking the quotas of a mailbox at RCPT TO time. And when you have many MX servers and only one mail hub that stores mail data it became a real problem. So I have written program (now it is perl script) that is daemon, it creates socket and listen for text message that consists of local_part, domain and quota values delimited by colon. If mailbox is full daemon writes back word 'bad' else 'good' and than close connection.
+Exim has no builtin facility for checking the quotas of a mailbox at RCPT TO time. And when you have many MX servers and only one mail hub that stores mail data it became a real problem. So I have written program (now it is perl script) that is daemon, it creates socket and listen for text message that consists of local_part, domain and quota values delimited by colon. If mailbox is full daemon writes back word _bad_ else _good_ and than close connection.
 
 = Details =
 
-*mailquotad* is developed on FreeBSD, so check if default values fit to your system. *mailquotad* supports some options:
+*mailquotad* is developed on FreeBSD, so check if default values fit to your system. *mailquotad* supports some cli options:
 {{{
 -h this help message
 -d <maildir> run in debug mode, do not became daemon
