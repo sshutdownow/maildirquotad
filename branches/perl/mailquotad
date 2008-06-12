@@ -47,7 +47,7 @@ if ($opt_h) {
     print <<'USAGE';
 -h this help message
 -d <maildir> run in debug mode, do not became daemon
--s <UNIX socket path|IP address[:port]>
+-s <UNIX socket path|IP address:port>
 -p <pid file path>
 -u <user>
 -g <group>
