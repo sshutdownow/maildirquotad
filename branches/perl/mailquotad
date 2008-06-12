@@ -1,0 +1,119 @@
+#!/usr/bin/perl -w
+use strict;
+
+use Socket;
+use Getopt::Std;
+use POSIX;
+use File::Basename;
+use Fcntl qw/LOCK_EX LOCK_NB/;
+use File::Find;
+
+use vars qw/$maxkeep $sockname $pidfile $debugmode $server_user $server_group $opt_d $opt_s $opt_p $opt_u $opt_g/;
+
+##############################################################################
+# Configuration
+##############################################################################
+
+# Maximum time to trust cached data.
+$maxkeep = 60;
+
+##############################################################################
+# End of Configuration
+##############################################################################
+
+# default values
+$sockname = '/var/run/quotad/mailquotad.sock';
+$pidfile  = '/var/run/quotad/mailquotad.pid';
+$server_user = 'mailnull';
+$server_group = 'mailnull';
+$debugmode = 0;
+
+
+getopts('d:s:p:u:g:');
+
+if ($opt_d) {
+    # This debug mode allows you to run your own checks against the maildir quota checker.
+    $debugmode = 1;
+    checkquota($opt_d);
+    exit;
+}
+if ($opt_s) {
+    $sockname = $opt_s;
+}
+if ($opt_p) {
+    $pidfile = $opt_p;
+}
+if ($opt_u) {
+    $server_user = $opt_u;
+}
+if ($opt_g) {
+    $server_group = $opt_g;
+}
+
+# check if we are already running
+my $program_name = basename($0);
+open(SELFLOCK, '<', "$0") or die("aborting: couldn't open $0: $!\n");
+flock(SELFLOCK, LOCK_EX | LOCK_NB) or die("aborting: another $program_name is already running\n");
+
+chdir('/') or die "aborting: can't chdir to '/': $!";
+
+# drop privileges
+setgid((getgrnam($server_user))[3])  or die "aborting: setgid() failed: $?";
+setuid((getpwnam($server_group))[2]) or die "aborting: setuid() failed: $?";
+
+# daemonize so that we run in the background.
+defined (my $pid = fork) or die "can't fork: $!";
+exit if ($pid);
+
+foreach my $sig ($SIG{TSTP}, $SIG{TTIN}, $SIG{TTOU}, $SIG{HUP}) {
+    $sig = 'IGNORE';
+}
+
+# record our pid.
+open(PIDFILE, '>', "$pidfile") or die "can't create pidfile $pidfile: $!|";
+print PIDFILE getpid();
+close(PIDFILE) or warn "close pidfile $pidfile failed: $!";
+
+open STDIN, '/dev/null' or die "can't read /dev/null: $!";
+open STDOUT, '>>/dev/null' or die "can't write to /dev/null: $!";
+open STDERR, '>>/dev/null' or die "can't write to /dev/null: $!";
+setsid or die "can't start a new session: $!";
+
+# ignore broken pipes
+$SIG{PIPE} = 'IGNORE';
+
+# make the socket and listen to it.
+socket(UNIX, PF_UNIX, SOCK_STREAM, 0) || die "socket failed: $!";
+unlink($sockname);
+bind(UNIX, sockaddr_un($sockname)) || die "bind failed: $!";
+chmod(0666, $sockname);
+listen(UNIX, SOMAXCONN) || die "listen failed: $!";
+
+# do the main bit.
+mainloop();
+
+sub mainloop {
+	# change our name
+	$0 = "mailquotad";
+
+	for (;;) {
+		my $maildirpath;
+		my $quotastatus; 
+
+		# read the socket, expecting a path.
+		accept(C, UNIX);
+		sysread(C, $maildirpath, 1024);
+		chomp($maildirpath);
+		$quotastatus = checkquota($maildirpath);
+		syswrite(C, $quotastatus);
+		close(C);
+	}
+}
+
+sub checkquota {
+    my $maildir = shift @_;
+    my $size = 0;
+    find( sub { $size += -s if -f;}, "/var/spool/mail/${maildir}");
+    print "quota for $maildir is $size\n" if ($debugmode);
+    return $size;
+}
