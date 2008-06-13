@@ -159,18 +159,26 @@ sub mainloop {
 	    if ($child = fork()) {
 		$client->close;
 	    } elsif (defined($child)) {
+		my $buf;
 		$socket->close();
 		$client->autoflush(1);
+		
+		# set timeout values
+		$client->setsockopt(SOL_SOCKET, SO_RCVTIMEO, pack('LL', 15, 0)) or warning(LOG_ERR, "setsockopt failed: $!");
+		$client->setsockopt(SOL_SOCKET, SO_SNDTIMEO, pack('LL', 15, 0)) or warning(LOG_ERR, "setsockopt failed: $!");
+
 		# read the socket, expecting a path.
-		if (defined(my $buf = <$client>)) {
+		if (defined($client->recv($buf, 8192, 0)) and defined($buf)) {
 		    chomp($buf);
 		    my ($localpart, $domain, $quota) = split(/:/, $buf);
 		    my $maildirpath = "$domain/$localpart";
 		    my $quotastatus = (checkquota($maildirpath) < $quota)? 'good' : 'bad';
-		    print $client $quotastatus;
+		    $client->send($quotastatus, 0) == length($quotastatus) or warning(LOG_ERR, "send failed: $!");
 		    warning(LOG_DEBUG, "quota for maildir for $maildirpath is $quotastatus");
+		} else {
+		    warning(LOG_ERR, "recv failed: $!");
 		}
-		$client->close();
+		$client->close() or warning(LOG_ERR, "close client socket failed: $!");
 		exit(0);
 	    } else {
 		warning(LOG_ERR, "fork failed: $!");
