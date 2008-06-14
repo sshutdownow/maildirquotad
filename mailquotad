@@ -1,7 +1,8 @@
 #!/usr/bin/perl -w
 use strict;
 
-#  	mailquotad - is used to determine whether Maildir quota is exeeded before message will be accepted at SMTP (RCPT TO) time.
+#  	mailquotad  is used in conjunction with exim for checking the quotas
+#	of a mailbox at RCPT TO time.
 #
 #   	Copyright (C) 2008 Igor Popov <ipopovi@gmail.com>
 #	
@@ -102,20 +103,17 @@ setgid((getgrnam($server_user))[3])  or error(LOG_ERR, "aborting: setgid() faile
 setuid((getpwnam($server_group))[2]) or error(LOG_ERR, "aborting: setuid() failed: $?");
 
 # daemonize so that we run in the background.
-defined (my $pid = fork) or die "can't fork: $!";
+defined (my $pid = fork) or error(LOG_ERR, "can't fork: $!");
 exit if ($pid);
 
 # set signal handlers
-foreach my $sig ($SIG{TSTP}, $SIG{TTIN}, $SIG{TTOU}, $SIG{HUP}) {
+foreach my $sig ($SIG{TSTP}, $SIG{TTIN}, $SIG{TTOU}, $SIG{HUP}, $SIG{PIPE}) {
     $sig = 'IGNORE';
 }
-# ignore broken pipes
-$SIG{PIPE} = 'IGNORE';
 # avoiding zombies
 $SIG{CHLD} = \&child_reap;
 # normally exits 
 $SIG{INT} = $SIG{TERM} = \&stop_working;
-
 
 # record our pid.
 open(PIDFILE, '>', "$pidfile") or error(LOG_ERR, "can't create pidfile $pidfile: $!");
@@ -132,19 +130,21 @@ setsid or error(LOG_ERR, "can't start a new session: $!");
 mainloop();
 
 sub mainloop {
-    my ($socket, $client, $child) = (undef, undef, undef);
+    my ($socket, $child) = (undef, undef, undef);
 
     # change our name
     $0 = "mailquotad";
     
     # make the socket and listen to it.
     if ($sockname =~ m{^/}) { # unix socket
-	unlink($sockname) or warning(LOG_WARNING, "unlink failed: $!");
+	if (-S $sockname) {
+	    unlink($sockname) or error(LOG_ERR, "unlink `$sockname' failed: $!");
+	}    
 	$socket = new IO::Socket::UNIX(Local => $sockname,
 				  Type => SOCK_STREAM,
 				  Listen => SOMAXCONN,
-				  ReuseAddr => 1) or error(LOG_ERR, "socket failed: $!");
-	chmod(0666, $sockname) or warning(LOG_WARNING, "chmod failed: $!");
+				  ReuseAddr => 1) or error(LOG_ERR, "socket `$sockname' failed: $!");
+	chmod(0666, $sockname) or warning(LOG_WARNING, "chmod `$sockname' failed: $!");
     } else { # tcp socket
 	$socket = new IO::Socket::INET(LocalAddr => $sockname,
 				  Proto => 'tcp',
@@ -153,35 +153,42 @@ sub mainloop {
     				  ReuseAddr => 1) or error(LOG_ERR, "socket failed: $!");
     }
     	
-
     while ($work) {
-	while ($client = $socket->accept()) {
-	    if ($child = fork()) {
-		$client->close;
-	    } elsif (defined($child)) {
-		my $buf;
+	while (my $client_socket = $socket->accept()) {
+	    unless (defined($child = fork())) {
+		warning(LOG_ERR, "fork failed: $!") ;
+	    } elsif ($child) { # parent
+		$client_socket->close();
+	    } else { # child
 		$socket->close();
-		$client->autoflush(1);
+		$client_socket->autoflush(1);
+		my $client_addr = sprintf("%s:%s", $client_socket->peerhost(), $client_socket->peerport());
+		my $buf = undef;
+		warning(LOG_DEBUG, "client `$client_addr' has connected");
 		
 		# set timeout values
-		$client->setsockopt(SOL_SOCKET, SO_RCVTIMEO, pack('LL', 15, 0)) or warning(LOG_ERR, "setsockopt failed: $!");
-		$client->setsockopt(SOL_SOCKET, SO_SNDTIMEO, pack('LL', 15, 0)) or warning(LOG_ERR, "setsockopt failed: $!");
+		$client_socket->setsockopt(SOL_SOCKET, SO_RCVTIMEO, pack('L!L!', 15, 0)) or warning(LOG_ERR, "setsockopt failed: $!");
+		$client_socket->setsockopt(SOL_SOCKET, SO_SNDTIMEO, pack('L!L!', 15, 0)) or warning(LOG_ERR, "setsockopt failed: $!");
 
 		# read the socket, expecting a path.
-		if (defined($client->recv($buf, 8192, 0)) and defined($buf)) {
+		$client_socket->recv($buf, 8192);
+		if (length($buf)) {
 		    chomp($buf);
-		    my ($localpart, $domain, $quota) = split(/:/, $buf);
-		    my $maildirpath = "$domain/$localpart";
-		    my $quotastatus = (checkquota($maildirpath) < $quota)? 'good' : 'bad';
-		    $client->send($quotastatus, 0) == length($quotastatus) or warning(LOG_ERR, "send failed: $!");
-		    warning(LOG_DEBUG, "quota for maildir for $maildirpath is $quotastatus");
-		} else {
-		    warning(LOG_ERR, "recv failed: $!");
+		    my ($localpart, $domain, $quota) = split(/:/, $buf, 3);
+		    if (defined($localpart) and defined($domain) and defined($quota)) {
+			my $quotastatus = (checkquota("$domain/$localpart") < $quota)? 'good' : 'bad';
+			$client_socket->send($quotastatus) == length($quotastatus) or warning(LOG_ERR, "send failed: $!");
+			warning(LOG_DEBUG, "quota for maildir for `$domain/$localpart' is `$quotastatus'");
+		    } else {
+			warning(LOG_INFO, "client `$client_addr' sends garbage: `$buf'");
+		    }
 		}
-		$client->close() or warning(LOG_ERR, "close client socket failed: $!");
+
+		if ($client_socket->connected()) {
+		    $client_socket->close() or warning(LOG_ERR, "close client `$client_addr' socket failed: $!");
+		}
+		warning(LOG_DEBUG, "child is going to exit");
 		exit(0);
-	    } else {
-		warning(LOG_ERR, "fork failed: $!");
 	    }
 	}
     }
@@ -197,7 +204,7 @@ sub checkquota {
     my $maildir = shift @_;
     my $size = 1024*512;
     return -1 unless (-d "${mail_spool_prefix}/${maildir}");
-    find( sub { $size += -s if -f;}, "${mail_spool_prefix}/${maildir}");
+    find( sub { $size += -s if -f; }, "${mail_spool_prefix}/${maildir}");
     warning(LOG_DEBUG, "maildirsize for $maildir is $size");
     return int($size/1024/1024);
 }
@@ -215,14 +222,13 @@ sub stop_working {
 }
 
 sub error {
-    my $priority = shift @_;
-    my $message = shift @_;
-    my $exitcode = shift @_ || 1;
+    my ($priority, $message, $exitcode) = shift @_;
+    $exitcode = 1 unless (defined $exitcode);
     
     if ($debugmode) {
 	print STDERR $message, "\n";
     } else {
-	syslog($priority, $message);
+	syslog($priority, "%s", $message);
     }
     closelog();
     exit($exitcode);
@@ -234,6 +240,6 @@ sub warning {
     if ($debugmode) {
 	print STDERR $message, "\n";
     } else {
-	syslog($priority, $message);
+	syslog($priority, "%s", $message);
     }
 }
