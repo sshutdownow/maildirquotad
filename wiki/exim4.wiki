@@ -1,4 +1,5 @@
 #summary using mailquotad with exim4.
+#labels Featured,Phase-Deploy
 
 = Using mailquotad with exim =
 
