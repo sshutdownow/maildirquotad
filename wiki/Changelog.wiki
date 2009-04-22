@@ -2,6 +2,11 @@
 
 == Changelog ==
 
+====18 Jun 2008====
+{{{
+Both unix and tcp sockets now are supported, version is bumped to 0.2.
+}}}
+
 ====12 Jun 2008====
 {{{
 The first working perl version 0.1 of mailquotad is released.
