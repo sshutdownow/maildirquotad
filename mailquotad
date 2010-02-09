@@ -99,7 +99,7 @@ flock(SELFLOCK, LOCK_EX | LOCK_NB) or error(LOG_ERR, "aborting: another $program
 chdir('/') or error(LOG_ERR, "aborting: can't chdir to '/': $!");
 
 # drop privileges
-setgid((getgrnam($server_user))[3])  or error(LOG_ERR, "aborting: setgid() failed: $?");
+setgid((getgrnam($server_user))[2])  or error(LOG_ERR, "aborting: setgid() failed: $?");
 setuid((getpwnam($server_group))[2]) or error(LOG_ERR, "aborting: setuid() failed: $?");
 
 # daemonize so that we run in the background.
