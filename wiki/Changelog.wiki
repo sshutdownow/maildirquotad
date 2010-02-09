@@ -1,6 +1,11 @@
 #summary Changelog.
+#labels Featured
 
 == Changelog ==
+====09 Feb 2010====
+{{{
+Added SRPM file for CentOS.
+}}}
 
 ====18 Jun 2008====
 {{{
