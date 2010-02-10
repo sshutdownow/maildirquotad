@@ -4,7 +4,7 @@
 == Changelog ==
 ====09 Feb 2010====
 {{{
-Added SRPM file for CentOS.
+A minor problem in which setgid sometimes gets an incorrect parameter was fixed. Added SRPM file for CentOS.
 }}}
 
 ====18 Jun 2008====
