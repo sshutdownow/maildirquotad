@@ -7,7 +7,8 @@
 
 = Details =
 
-*mailquotad* is developed on [http://www.freebsd.org/ FreeBSD], so check if default values fit to your system. *mailquotad* supports some cli options:
+For tar.gz archive default settings for *mailquotad* are suitable for [http://www.freebsd.org/ FreeBSD] and there is a RPM package for RedHat Linux For other OSes, please, check if default values fit to your system.
+*mailquotad* supports some cli options:
 {{{
 -h this help message
 -d <maildir> run in debug mode, do not became daemon
