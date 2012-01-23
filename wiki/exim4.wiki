@@ -7,7 +7,7 @@
 
 = Details =
 
-For tar.gz archive default settings for *mailquotad* are suitable for [http://www.freebsd.org/ FreeBSD] and there is a RPM package for RedHat Linux For other OSes, please, check if default values fit to your system.
+For *mailquotad*  in tar.gz archive default settings and daemon's rc.d script are suitable for [http://www.freebsd.org/ FreeBSD] and there is a RPM package for RedHat Linux. For other OSes, please, check if default values fit to your system.
 *mailquotad* supports some cli options:
 {{{
 -h this help message
@@ -19,7 +19,7 @@ For tar.gz archive default settings for *mailquotad* are suitable for [http://ww
 -m <mail spool prefix>
 }}} 
 
-add to your exim acl something like this:
+To check quota in exim you should add to your exim's acl rules something like this:
 {{{
 acl_check_rcpt:
 #
